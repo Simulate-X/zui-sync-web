@@ -191,7 +191,7 @@ export default function Page() {
     setLoading(false);
 
     if (dbErr || !data) {
-      setError('TV bulunamadı. TV Kimliği veya Cihaz Anahtarı hatalı olabilir.');
+      setError(`TV bulunamadı. (${dbErr?.message ?? 'veri yok'}) — Kimlik: ${id} / Anahtar: ${key}`);
       return;
     }
 
