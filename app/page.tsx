@@ -6,11 +6,13 @@ import { supabase } from '@/lib/supabase';
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Step = 'verify' | 'manage';
+type SourceType = 'm3u' | 'xtream';
 
 type Playlist = {
   id: number;
   playlist_name: string | null;
   playlist_url: string;
+  source_type: string;
   sent_at: string;
   loaded: boolean;
 };
@@ -22,7 +24,7 @@ const isValidUrl = (s: string) => /^https?:\/\/.+/.test(s.trim());
 async function fetchPlaylists(deviceId: string): Promise<Playlist[]> {
   const { data } = await supabase
     .from('playlists')
-    .select('id, playlist_name, playlist_url, sent_at, loaded')
+    .select('id, playlist_name, playlist_url, source_type, sent_at, loaded')
     .eq('device_id', deviceId)
     .order('sent_at', { ascending: false });
   return (data ?? []) as Playlist[];
@@ -193,6 +195,7 @@ function PlaylistRow({ pl, onDelete, deleting }: {
   pl: Playlist; onDelete: (id: number) => void; deleting: boolean;
 }) {
   const name = pl.playlist_name?.trim() || hostname(pl.playlist_url);
+  const isXtream = pl.source_type === 'xtream';
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 12,
@@ -203,6 +206,7 @@ function PlaylistRow({ pl, onDelete, deleting }: {
     }}>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, flexShrink: 0 }}>{isXtream ? '🔑' : '📋'}</span>
           <span style={{
             fontSize: 13, fontWeight: 600,
             color: pl.loaded ? 'rgba(110,231,183,0.8)' : 'rgba(255,255,255,0.75)',
@@ -220,7 +224,7 @@ function PlaylistRow({ pl, onDelete, deleting }: {
           fontSize: 11, color: 'rgba(255,255,255,0.22)', marginTop: 2,
           fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
         }}>
-          {hostname(pl.playlist_url)} · {fmtDate(pl.sent_at)}
+          {isXtream ? 'Xtream · ' : ''}{hostname(pl.playlist_url)} · {fmtDate(pl.sent_at)}
         </div>
       </div>
       <button
@@ -246,10 +250,18 @@ function PlaylistRow({ pl, onDelete, deleting }: {
 
 export default function Page() {
   const [step, setStep]               = useState<Step>('verify');
+  const [sourceType, setSourceType]   = useState<SourceType>('m3u');
   const [deviceId, setDeviceId]       = useState('');
   const [deviceKey, setDeviceKey]     = useState('');
+  // M3U alanları
   const [playlistUrl, setPlaylistUrl] = useState('');
   const [listName, setListName]       = useState('');
+  // Xtream alanları
+  const [xtHost, setXtHost]           = useState('');
+  const [xtUser, setXtUser]           = useState('');
+  const [xtPass, setXtPass]           = useState('');
+  const [xtName, setXtName]           = useState('');
+
   const [playlists, setPlaylists]     = useState<Playlist[]>([]);
   const [loading, setLoading]         = useState(false);
   const [deleteId, setDeleteId]       = useState<number | null>(null);
@@ -284,31 +296,45 @@ export default function Page() {
 
   // ── Adım 2: Liste ekle ───────────────────────────────────────────────────
   const handleAdd = async () => {
-    const url = playlistUrl.trim();
-    if (!isValidUrl(url)) return;
     setLoading(true); setError(null); setAddSuccess(false);
 
-    // Aynı URL zaten ekli mi kontrol et
-    const duplicate = playlists.find(p => p.playlist_url === url);
-    if (duplicate) {
-      setLoading(false);
-      setError('Bu URL zaten listede mevcut.');
-      return;
+    let insertData: Record<string, unknown>;
+
+    if (sourceType === 'xtream') {
+      const host = xtHost.trim();
+      const user = xtUser.trim();
+      const pass = xtPass.trim();
+      if (!isValidUrl(host) || !user || !pass) {
+        setLoading(false);
+        setError('Sunucu URL, kullanıcı adı ve şifre zorunludur.');
+        return;
+      }
+      const duplicate = playlists.find(p => p.playlist_url === host && p.source_type === 'xtream');
+      if (duplicate) { setLoading(false); setError('Bu Xtream sunucusu zaten listede.'); return; }
+      insertData = {
+        device_id: deviceId, source_type: 'xtream',
+        playlist_url: host, playlist_name: xtName.trim() || null,
+        xtream_username: user, xtream_password: pass,
+      };
+    } else {
+      const url = playlistUrl.trim();
+      if (!isValidUrl(url)) { setLoading(false); setError('Geçerli bir M3U URL girin.'); return; }
+      const duplicate = playlists.find(p => p.playlist_url === url && p.source_type !== 'xtream');
+      if (duplicate) { setLoading(false); setError('Bu URL zaten listede mevcut.'); return; }
+      insertData = {
+        device_id: deviceId, source_type: 'm3u',
+        playlist_url: url, playlist_name: listName.trim() || null,
+      };
     }
 
-    const { error: dbErr } = await supabase.from('playlists').insert({
-      device_id:     deviceId,
-      playlist_url:  url,
-      playlist_name: listName.trim() || null,
-    });
-
+    const { error: dbErr } = await supabase.from('playlists').insert(insertData);
     if (dbErr) {
       setLoading(false);
       setError('Gönderim başarısız oldu. Lütfen tekrar deneyin.');
       return;
     }
     await reload(deviceId);
-    setPlaylistUrl(''); setListName('');
+    setPlaylistUrl(''); setListName(''); setXtHost(''); setXtUser(''); setXtPass(''); setXtName('');
     setAddSuccess(true);
     setLoading(false);
     setTimeout(() => setAddSuccess(false), 4000);
@@ -323,9 +349,11 @@ export default function Page() {
   };
 
   const reset = () => {
-    setStep('verify'); setDeviceId(''); setDeviceKey('');
-    setPlaylistUrl(''); setListName(''); setPlaylists([]);
-    setError(null); setAddSuccess(false);
+    setStep('verify'); setSourceType('m3u');
+    setDeviceId(''); setDeviceKey('');
+    setPlaylistUrl(''); setListName('');
+    setXtHost(''); setXtUser(''); setXtPass(''); setXtName('');
+    setPlaylists([]); setError(null); setAddSuccess(false);
   };
 
   // ─── Render ──────────────────────────────────────────────────────────────
@@ -422,24 +450,66 @@ export default function Page() {
 
             {/* Yeni liste ekle */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              <Field label="Yeni M3U URL">
-                <input value={playlistUrl} onChange={e => setPlaylistUrl(e.target.value)}
-                  placeholder="https://example.com/playlist.m3u"
-                  type="url" autoFocus
-                  onKeyDown={e => e.key === 'Enter' && handleAdd()} />
-              </Field>
+              {/* Tip seçici */}
+              <div style={{ display: 'flex', gap: 8 }}>
+                {(['m3u', 'xtream'] as SourceType[]).map(t => (
+                  <button key={t} onClick={() => { setSourceType(t); setError(null); }} style={{
+                    flex: 1, padding: '9px 0', borderRadius: 10, border: 'none',
+                    cursor: 'pointer', fontSize: 13, fontWeight: 600, transition: 'all 0.15s',
+                    background: sourceType === t ? 'rgba(232,181,103,0.15)' : 'rgba(255,255,255,0.04)',
+                    color: sourceType === t ? '#E8B567' : 'rgba(255,255,255,0.35)',
+                    outline: sourceType === t ? '1px solid rgba(232,181,103,0.35)' : '1px solid rgba(255,255,255,0.07)',
+                  }}>
+                    {t === 'm3u' ? '📋 M3U URL' : '🔑 Xtream Codes'}
+                  </button>
+                ))}
+              </div>
 
-              <Field label="Liste Adı" optional>
-                <input value={listName} onChange={e => setListName(e.target.value)}
-                  placeholder="Aile Listesi, Yedek..."
-                  onKeyDown={e => e.key === 'Enter' && handleAdd()} />
-              </Field>
+              {/* M3U alanları */}
+              {sourceType === 'm3u' && <>
+                <Field label="M3U URL">
+                  <input value={playlistUrl} onChange={e => setPlaylistUrl(e.target.value)}
+                    placeholder="https://example.com/playlist.m3u"
+                    type="url" autoFocus
+                    onKeyDown={e => e.key === 'Enter' && handleAdd()} />
+                </Field>
+                <Field label="Liste Adı" optional>
+                  <input value={listName} onChange={e => setListName(e.target.value)}
+                    placeholder="Aile Listesi, Yedek..."
+                    onKeyDown={e => e.key === 'Enter' && handleAdd()} />
+                </Field>
+              </>}
+
+              {/* Xtream alanları */}
+              {sourceType === 'xtream' && <>
+                <Field label="Sunucu URL">
+                  <input value={xtHost} onChange={e => setXtHost(e.target.value)}
+                    placeholder="http://provider.com:8080"
+                    type="url" autoFocus
+                    onKeyDown={e => e.key === 'Enter' && handleAdd()} />
+                </Field>
+                <Field label="Kullanıcı Adı">
+                  <input value={xtUser} onChange={e => setXtUser(e.target.value)}
+                    placeholder="username"
+                    onKeyDown={e => e.key === 'Enter' && handleAdd()} />
+                </Field>
+                <Field label="Şifre">
+                  <input value={xtPass} onChange={e => setXtPass(e.target.value)}
+                    placeholder="••••••••" type="password"
+                    onKeyDown={e => e.key === 'Enter' && handleAdd()} />
+                </Field>
+                <Field label="Sağlayıcı Adı" optional>
+                  <input value={xtName} onChange={e => setXtName(e.target.value)}
+                    placeholder="Xtream Provider"
+                    onKeyDown={e => e.key === 'Enter' && handleAdd()} />
+                </Field>
+              </>}
 
               {error      && <ErrorBox   message={error} />}
               {addSuccess && <SuccessBox message="Liste gönderildi! TV'de Yeniden Yükle'ye basın." />}
 
               <PrimaryButton onClick={handleAdd} loading={loading}
-                disabled={!isValidUrl(playlistUrl)}>
+                disabled={sourceType === 'm3u' ? !isValidUrl(playlistUrl) : !isValidUrl(xtHost) || !xtUser.trim() || !xtPass.trim()}>
                 TV&apos;ye Gönder
               </PrimaryButton>
             </div>
