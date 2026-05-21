@@ -284,12 +284,21 @@ export default function Page() {
 
   // ── Adım 2: Liste ekle ───────────────────────────────────────────────────
   const handleAdd = async () => {
-    if (!isValidUrl(playlistUrl)) return;
+    const url = playlistUrl.trim();
+    if (!isValidUrl(url)) return;
     setLoading(true); setError(null); setAddSuccess(false);
+
+    // Aynı URL zaten ekli mi kontrol et
+    const duplicate = playlists.find(p => p.playlist_url === url);
+    if (duplicate) {
+      setLoading(false);
+      setError('Bu URL zaten listede mevcut.');
+      return;
+    }
 
     const { error: dbErr } = await supabase.from('playlists').insert({
       device_id:     deviceId,
-      playlist_url:  playlistUrl.trim(),
+      playlist_url:  url,
       playlist_name: listName.trim() || null,
     });
 
