@@ -308,17 +308,29 @@ export default function Page() {
     const autoVerify = async () => {
       setLoading(true); setError(null);
       const client = makeKeyedClient(qId, qKey);
-      const { data, error: dbErr } = await client
-        .from('devices').select('device_id').eq('device_id', qId).single();
-      if (dbErr || !data) {
-        setLoading(false);
-        setError('TV not found. Please check the TV ID and Device Key.');
-        return;
+
+      // Retry up to 5 times with 2-second gaps.
+      // The TV app needs a moment to register itself in Supabase after launch —
+      // this handles the race condition when the QR is scanned right away.
+      const MAX_ATTEMPTS = 5;
+      const DELAY_MS     = 2000;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const { data, error: dbErr } = await client
+          .from('devices').select('device_id').eq('device_id', qId).single();
+        if (!dbErr && data) {
+          keyedClientRef.current = client;
+          setPlaylists(await fetchPlaylists(client, qId));
+          setLoading(false);
+          setStep('manage');
+          return;
+        }
+        if (attempt < MAX_ATTEMPTS) {
+          await new Promise(r => setTimeout(r, DELAY_MS));
+        }
       }
-      keyedClientRef.current = client;
-      setPlaylists(await fetchPlaylists(client, qId));
+
       setLoading(false);
-      setStep('manage');
+      setError('TV not found. Make sure the ZUI app is open on your TV, then tap Verify TV.');
     };
     void autoVerify();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -485,6 +497,13 @@ export default function Page() {
                 style={{ fontFamily: 'monospace', letterSpacing: '0.08em' }}
                 onKeyDown={e => e.key === 'Enter' && handleVerify()} />
             </Field>
+
+            {loading && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'rgba(255,255,255,0.4)', fontSize: 13 }}>
+                <Spinner />
+                Connecting to TV… (may take up to 10 s on first launch)
+              </div>
+            )}
 
             {error && <ErrorBox message={error} />}
 
