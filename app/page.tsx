@@ -398,7 +398,7 @@ export default function Page() {
     const { error: dbErr } = await client.from('playlists').insert(insertData);
     if (dbErr) {
       setLoading(false);
-      setError('Failed to send. Please try again.');
+      setError(`Failed to send: ${dbErr.message}`);
       return;
     }
     await reload(deviceId);
