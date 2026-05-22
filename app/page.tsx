@@ -1,7 +1,26 @@
 'use client';
 
-import { useState, useCallback } from 'react';
-import { supabase } from '@/lib/supabase';
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+
+// ─── Keyed client factory ─────────────────────────────────────────────────────
+// Creates a Supabase client with device auth headers so RLS policies can
+// enforce both device_id AND device_key on every request.
+
+function makeKeyedClient(deviceId: string, deviceKey: string): SupabaseClient {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      global: {
+        headers: {
+          'x-zui-device-id':  deviceId,
+          'x-zui-device-key': deviceKey,
+        },
+      },
+    }
+  );
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -21,8 +40,8 @@ type Playlist = {
 
 const isValidUrl = (s: string) => /^https?:\/\/.+/.test(s.trim());
 
-async function fetchPlaylists(deviceId: string): Promise<Playlist[]> {
-  const { data } = await supabase
+async function fetchPlaylists(client: SupabaseClient, deviceId: string): Promise<Playlist[]> {
+  const { data } = await client
     .from('playlists')
     .select('id, playlist_name, playlist_url, source_type, sent_at, loaded')
     .eq('device_id', deviceId)
@@ -35,7 +54,7 @@ function hostname(url: string) {
 }
 
 function fmtDate(iso: string) {
-  return new Date(iso).toLocaleString('tr-TR', {
+  return new Date(iso).toLocaleString('en-GB', {
     day: '2-digit', month: '2-digit',
     hour: '2-digit', minute: '2-digit',
   });
@@ -104,7 +123,7 @@ function Field({ label, optional, children }: {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <label style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.3em', color: 'rgba(255,255,255,0.3)', fontWeight: 600 }}>
         {label}
-        {optional && <span style={{ marginLeft: 8, textTransform: 'none', letterSpacing: 'normal', color: 'rgba(255,255,255,0.18)', fontWeight: 400 }}>opsiyonel</span>}
+        {optional && <span style={{ marginLeft: 8, textTransform: 'none', letterSpacing: 'normal', color: 'rgba(255,255,255,0.18)', fontWeight: 400 }}>optional</span>}
       </label>
       {children}
     </div>
@@ -175,7 +194,7 @@ function DeviceBadge({ deviceId }: { deviceId: string }) {
     }}>
       <span style={{ color: '#E8B567', opacity: 0.7 }}><IconTV /></span>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-        <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', textTransform: 'uppercase', letterSpacing: '0.25em' }}>Bağlı TV</span>
+        <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', textTransform: 'uppercase', letterSpacing: '0.25em' }}>Connected TV</span>
         <span style={{ fontFamily: 'monospace', fontSize: 16, color: 'rgba(232,181,103,0.9)', letterSpacing: '0.1em' }}>{deviceId}</span>
       </div>
       <span style={{
@@ -216,7 +235,7 @@ function PlaylistRow({ pl, onDelete, deleting }: {
           </span>
           {pl.loaded && (
             <span style={{ fontSize: 9, textTransform: 'uppercase', letterSpacing: '0.2em', color: 'rgba(52,211,153,0.55)', flexShrink: 0 }}>
-              ✓ yüklendi
+              ✓ loaded
             </span>
           )}
         </div>
@@ -253,10 +272,10 @@ export default function Page() {
   const [sourceType, setSourceType]   = useState<SourceType>('m3u');
   const [deviceId, setDeviceId]       = useState('');
   const [deviceKey, setDeviceKey]     = useState('');
-  // M3U alanları
+  // M3U fields
   const [playlistUrl, setPlaylistUrl] = useState('');
   const [listName, setListName]       = useState('');
-  // Xtream alanları
+  // Xtream fields
   const [xtHost, setXtHost]           = useState('');
   const [xtUser, setXtUser]           = useState('');
   const [xtPass, setXtPass]           = useState('');
@@ -268,34 +287,69 @@ export default function Page() {
   const [error, setError]             = useState<string | null>(null);
   const [addSuccess, setAddSuccess]   = useState(false);
 
+  // Keyed client stored after successful verification
+  const keyedClientRef = useRef<SupabaseClient | null>(null);
+
   const reload = useCallback(async (id: string) => {
-    setPlaylists(await fetchPlaylists(id));
+    if (!keyedClientRef.current) return;
+    setPlaylists(await fetchPlaylists(keyedClientRef.current, id));
   }, []);
 
-  // ── Adım 1: Cihaz doğrulama ──────────────────────────────────────────────
+  // ── Auto-verify from QR code URL params (?id=…&key=…) ────────────────────
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const qId  = params.get('id')?.toUpperCase().trim()  ?? '';
+    const qKey = params.get('key')?.toLowerCase().trim() ?? '';
+    if (!qId || !qKey) return;
+
+    setDeviceId(qId);
+    setDeviceKey(qKey);
+
+    const autoVerify = async () => {
+      setLoading(true); setError(null);
+      const client = makeKeyedClient(qId, qKey);
+      const { data, error: dbErr } = await client
+        .from('devices').select('device_id').eq('device_id', qId).single();
+      if (dbErr || !data) {
+        setLoading(false);
+        setError('TV not found. Please check the TV ID and Device Key.');
+        return;
+      }
+      keyedClientRef.current = client;
+      setPlaylists(await fetchPlaylists(client, qId));
+      setLoading(false);
+      setStep('manage');
+    };
+    void autoVerify();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Step 1: Manual verify ────────────────────────────────────────────────
   const handleVerify = async () => {
     const id  = deviceId.trim().toUpperCase();
     const key = deviceKey.trim().toLowerCase();
     if (!id || !key) return;
     setLoading(true); setError(null);
 
-    const { data, error: dbErr } = await supabase
-      .from('devices').select('device_id')
-      .eq('device_id', id).eq('device_key', key).single();
+    const client = makeKeyedClient(id, key);
+    const { data, error: dbErr } = await client
+      .from('devices').select('device_id').eq('device_id', id).single();
 
     if (dbErr || !data) {
       setLoading(false);
-      setError('TV bulunamadı. Lütfen TV Kimliği ve Cihaz Anahtarını kontrol edin.');
+      setError('TV not found. Please check the TV ID and Device Key.');
       return;
     }
+    keyedClientRef.current = client;
     setDeviceId(id);
-    setPlaylists(await fetchPlaylists(id));
+    setPlaylists(await fetchPlaylists(client, id));
     setLoading(false);
     setStep('manage');
   };
 
-  // ── Adım 2: Liste ekle ───────────────────────────────────────────────────
+  // ── Step 2: Add playlist ─────────────────────────────────────────────────
   const handleAdd = async () => {
+    const client = keyedClientRef.current;
+    if (!client) return;
     setLoading(true); setError(null); setAddSuccess(false);
 
     let insertData: Record<string, unknown>;
@@ -306,31 +360,33 @@ export default function Page() {
       const pass = xtPass.trim();
       if (!isValidUrl(host) || !user || !pass) {
         setLoading(false);
-        setError('Sunucu URL, kullanıcı adı ve şifre zorunludur.');
+        setError('Server URL, username, and password are required.');
         return;
       }
       const duplicate = playlists.find(p => p.playlist_url === host && p.source_type === 'xtream');
-      if (duplicate) { setLoading(false); setError('Bu Xtream sunucusu zaten listede.'); return; }
+      if (duplicate) { setLoading(false); setError('This Xtream server is already in the list.'); return; }
       insertData = {
-        device_id: deviceId, source_type: 'xtream',
+        device_id: deviceId, device_key: deviceKey.trim().toLowerCase(),
+        source_type: 'xtream',
         playlist_url: host, playlist_name: xtName.trim() || null,
         xtream_username: user, xtream_password: pass,
       };
     } else {
       const url = playlistUrl.trim();
-      if (!isValidUrl(url)) { setLoading(false); setError('Geçerli bir M3U URL girin.'); return; }
+      if (!isValidUrl(url)) { setLoading(false); setError('Please enter a valid M3U URL.'); return; }
       const duplicate = playlists.find(p => p.playlist_url === url && p.source_type !== 'xtream');
-      if (duplicate) { setLoading(false); setError('Bu URL zaten listede mevcut.'); return; }
+      if (duplicate) { setLoading(false); setError('This URL is already in the list.'); return; }
       insertData = {
-        device_id: deviceId, source_type: 'm3u',
+        device_id: deviceId, device_key: deviceKey.trim().toLowerCase(),
+        source_type: 'm3u',
         playlist_url: url, playlist_name: listName.trim() || null,
       };
     }
 
-    const { error: dbErr } = await supabase.from('playlists').insert(insertData);
+    const { error: dbErr } = await client.from('playlists').insert(insertData);
     if (dbErr) {
       setLoading(false);
-      setError('Gönderim başarısız oldu. Lütfen tekrar deneyin.');
+      setError('Failed to send. Please try again.');
       return;
     }
     await reload(deviceId);
@@ -340,10 +396,12 @@ export default function Page() {
     setTimeout(() => setAddSuccess(false), 4000);
   };
 
-  // ── Sil ──────────────────────────────────────────────────────────────────
+  // ── Delete ───────────────────────────────────────────────────────────────
   const handleDelete = async (id: number) => {
+    const client = keyedClientRef.current;
+    if (!client) return;
     setDeleteId(id);
-    await supabase.from('playlists').delete().eq('id', id);
+    await client.from('playlists').delete().eq('id', id);
     await reload(deviceId);
     setDeleteId(null);
   };
@@ -354,6 +412,9 @@ export default function Page() {
     setPlaylistUrl(''); setListName('');
     setXtHost(''); setXtUser(''); setXtPass(''); setXtName('');
     setPlaylists([]); setError(null); setAddSuccess(false);
+    keyedClientRef.current = null;
+    // Clear URL params so a refresh shows the clean form
+    window.history.replaceState({}, '', window.location.pathname);
   };
 
   // ─── Render ──────────────────────────────────────────────────────────────
@@ -364,6 +425,14 @@ export default function Page() {
         @keyframes spin    { to { transform: rotate(360deg); } }
         @keyframes fadeIn  { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
         .card { animation: fadeIn 0.3s ease; }
+        input {
+          width: 100%; padding: 12px 14px; border-radius: 10px;
+          background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+          color: rgba(255,255,255,0.85); font-size: 14px; outline: none;
+          transition: border-color 0.15s;
+        }
+        input:focus { border-color: rgba(232,181,103,0.4); }
+        input::placeholder { color: rgba(255,255,255,0.2); }
       `}</style>
 
       <main style={{
@@ -394,25 +463,25 @@ export default function Page() {
           display: 'flex', flexDirection: 'column', gap: 20,
         }}>
 
-          {/* ══ Step 1: Doğrula ══ */}
+          {/* ══ Step 1: Verify ══ */}
           {step === 'verify' && <>
             <div>
-              <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>TV&apos;nizi doğrulayın</h2>
+              <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Verify your TV</h2>
               <p style={{ margin: '6px 0 0', fontSize: 14, color: 'rgba(255,255,255,0.4)', lineHeight: 1.5 }}>
-                TV&apos;deki ZUI uygulamasını açın → Cloud Sync ekranındaki bilgileri girin.
+                Open the ZUI app on your TV → go to Cloud Sync and enter the details shown on screen.
               </p>
             </div>
 
-            <Field label="TV Kimliği">
+            <Field label="TV ID">
               <input value={deviceId} onChange={e => setDeviceId(e.target.value)}
-                placeholder="5ADB-21C2"
+                placeholder="A1B2-C3D4"
                 style={{ fontFamily: 'monospace', letterSpacing: '0.08em', textTransform: 'uppercase' }}
                 onKeyDown={e => e.key === 'Enter' && handleVerify()} />
             </Field>
 
-            <Field label="Cihaz Anahtarı">
+            <Field label="Device Key">
               <input value={deviceKey} onChange={e => setDeviceKey(e.target.value)}
-                placeholder="st5q8y"
+                placeholder="ab3x9z"
                 style={{ fontFamily: 'monospace', letterSpacing: '0.08em' }}
                 onKeyDown={e => e.key === 'Enter' && handleVerify()} />
             </Field>
@@ -421,26 +490,26 @@ export default function Page() {
 
             <PrimaryButton onClick={handleVerify} loading={loading}
               disabled={!deviceId.trim() || !deviceKey.trim()}>
-              TV&apos;yi Doğrula
+              Verify TV
             </PrimaryButton>
           </>}
 
-          {/* ══ Step 2: Liste Yöneticisi ══ */}
+          {/* ══ Step 2: Playlist Manager ══ */}
           {step === 'manage' && <>
             <div>
-              <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Liste Yöneticisi</h2>
+              <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Playlist Manager</h2>
               <p style={{ margin: '6px 0 0', fontSize: 14, color: 'rgba(255,255,255,0.4)', lineHeight: 1.5 }}>
-                TV&apos;ye M3U URL gönderin. Her liste ayrı kayıt olarak eklenir.
+                Send a playlist URL to your TV. Each playlist is stored as a separate record.
               </p>
             </div>
 
             <DeviceBadge deviceId={deviceId} />
 
-            {/* Mevcut listeler */}
+            {/* Sent playlists */}
             {playlists.length > 0 && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <span style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.3em', color: 'rgba(255,255,255,0.3)', fontWeight: 600 }}>
-                  Gönderilen Listeler ({playlists.length})
+                  Sent Playlists ({playlists.length})
                 </span>
                 {playlists.map(pl => (
                   <PlaylistRow key={pl.id} pl={pl} onDelete={handleDelete} deleting={deleteId === pl.id} />
@@ -448,9 +517,9 @@ export default function Page() {
               </div>
             )}
 
-            {/* Yeni liste ekle */}
+            {/* Add new playlist */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              {/* Tip seçici */}
+              {/* Type selector */}
               <div style={{ display: 'flex', gap: 8 }}>
                 {(['m3u', 'xtream'] as SourceType[]).map(t => (
                   <button key={t} onClick={() => { setSourceType(t); setError(null); }} style={{
@@ -465,7 +534,7 @@ export default function Page() {
                 ))}
               </div>
 
-              {/* M3U alanları */}
+              {/* M3U fields */}
               {sourceType === 'm3u' && <>
                 <Field label="M3U URL">
                   <input value={playlistUrl} onChange={e => setPlaylistUrl(e.target.value)}
@@ -473,44 +542,44 @@ export default function Page() {
                     type="url" autoFocus
                     onKeyDown={e => e.key === 'Enter' && handleAdd()} />
                 </Field>
-                <Field label="Liste Adı" optional>
+                <Field label="Playlist Name" optional>
                   <input value={listName} onChange={e => setListName(e.target.value)}
-                    placeholder="Aile Listesi, Yedek..."
+                    placeholder="Family, Backup…"
                     onKeyDown={e => e.key === 'Enter' && handleAdd()} />
                 </Field>
               </>}
 
-              {/* Xtream alanları */}
+              {/* Xtream fields */}
               {sourceType === 'xtream' && <>
-                <Field label="Sunucu URL">
+                <Field label="Server URL">
                   <input value={xtHost} onChange={e => setXtHost(e.target.value)}
                     placeholder="http://provider.com:8080"
                     type="url" autoFocus
                     onKeyDown={e => e.key === 'Enter' && handleAdd()} />
                 </Field>
-                <Field label="Kullanıcı Adı">
+                <Field label="Username">
                   <input value={xtUser} onChange={e => setXtUser(e.target.value)}
                     placeholder="username"
                     onKeyDown={e => e.key === 'Enter' && handleAdd()} />
                 </Field>
-                <Field label="Şifre">
+                <Field label="Password">
                   <input value={xtPass} onChange={e => setXtPass(e.target.value)}
                     placeholder="••••••••" type="password"
                     onKeyDown={e => e.key === 'Enter' && handleAdd()} />
                 </Field>
-                <Field label="Sağlayıcı Adı" optional>
+                <Field label="Provider Name" optional>
                   <input value={xtName} onChange={e => setXtName(e.target.value)}
-                    placeholder="Xtream Provider"
+                    placeholder="My IPTV Provider"
                     onKeyDown={e => e.key === 'Enter' && handleAdd()} />
                 </Field>
               </>}
 
               {error      && <ErrorBox   message={error} />}
-              {addSuccess && <SuccessBox message="Liste gönderildi! TV'de Yeniden Yükle'ye basın." />}
+              {addSuccess && <SuccessBox message="Playlist sent! Press Reload on the TV." />}
 
               <PrimaryButton onClick={handleAdd} loading={loading}
                 disabled={sourceType === 'm3u' ? !isValidUrl(playlistUrl) : !isValidUrl(xtHost) || !xtUser.trim() || !xtPass.trim()}>
-                TV&apos;ye Gönder
+                Send to TV
               </PrimaryButton>
             </div>
 
@@ -518,14 +587,14 @@ export default function Page() {
               background: 'none', border: 'none', color: 'rgba(255,255,255,0.3)',
               fontSize: 13, cursor: 'pointer', padding: '4px 0',
             }}>
-              ← Farklı TV seç
+              ← Switch TV
             </button>
           </>}
 
         </div>
 
         <p style={{ marginTop: 28, fontSize: 11, color: 'rgba(255,255,255,0.2)', letterSpacing: '0.3em', textTransform: 'uppercase' }}>
-          ZUI IPTV Player · Açık Kaynak · MIT
+          ZUI IPTV Player · Open Source · MIT
         </p>
       </main>
     </>
